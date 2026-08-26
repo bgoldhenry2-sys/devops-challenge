@@ -1,0 +1,156 @@
+name: backend
+
+# Backend HTTP API -> EC2 (Auto Scaling Group) via S3 artifact + CodeDeploy blue/green.
+# No long-lived AWS keys anywhere: GitHub OIDC assumes a per-environment IAM role.
+
+on:
+  pull_request:
+    paths: ["backend/**", ".github/workflows/backend.yml"]
+  push:
+    branches: [main]
+    paths: ["backend/**", ".github/workflows/backend.yml"]
+  workflow_dispatch:
+    inputs:
+      rollback_to:
+        description: "Artifact version (git SHA) to redeploy for rollback"
+        required: false
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for AWS role assumption
+
+# Never allow two deploys to interleave; do not cancel a running prod deploy
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-1
+  ARTIFACT_BUCKET: example-release-artifacts
+  APP_NAME: backend-api
+
+jobs:
+  ci:
+    # Skipped on rollback dispatch: the target artifact is already immutable in S3,
+    # so rebuilding would only delay the rollback.
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults: { run: { working-directory: backend } }
+    steps:
+      # In a real repo, pin all actions by commit SHA (supply-chain hardening)
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: backend/.nvmrc
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Install (reproducible)
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Unit tests (fail pipeline on failure or coverage drop)
+        run: npm test -- --coverage
+      - name: Dependency audit (block known-critical vulns)
+        run: npm audit --omit=dev --audit-level=critical
+      - name: Build
+        run: npm run build
+      - name: Package release tarball
+        run: |
+          tar -czf "../${APP_NAME}-${GITHUB_SHA}.tar.gz" dist/ appspec.yml deploy/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: ${{ env.APP_NAME }}-${{ github.sha }}.tar.gz
+          retention-days: 30
+
+  publish-artifact:
+    # Only on main: CI artifact becomes the immutable release candidate
+    if: github.event_name == 'push'
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: release }
+      - name: Assume AWS role via OIDC (no static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::111111111111:role/gha-backend-artifact-publisher
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Upload immutable artifact to S3 (bucket has versioning + deny-overwrite policy)
+        run: |
+          aws s3 cp "${APP_NAME}-${GITHUB_SHA}.tar.gz" \
+            "s3://${ARTIFACT_BUCKET}/${APP_NAME}/${GITHUB_SHA}.tar.gz" --if-none-match "*"
+
+  deploy-staging:
+    if: github.event_name == 'push'
+    needs: publish-artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: staging # env-scoped OIDC role + URL tracking
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::111111111111:role/gha-backend-deploy-staging
+          aws-region: ${{ env.AWS_REGION }}
+      - name: CodeDeploy blue/green to staging ASG
+        run: |
+          DEPLOY_ID=$(aws deploy create-deployment \
+            --application-name ${APP_NAME} \
+            --deployment-group-name staging \
+            --deployment-config-name CodeDeployDefault.OneAtATime \
+            --s3-location bucket=${ARTIFACT_BUCKET},key=${APP_NAME}/${GITHUB_SHA}.tar.gz,bundleType=tgz \
+            --query deploymentId --output text)
+          aws deploy wait deployment-successful --deployment-id "$DEPLOY_ID"
+      - name: Smoke test through the load balancer (the path users take)
+        run: ./scripts/smoke.sh https://api.staging.example.com
+
+  deploy-production:
+    # Two entry paths:
+    #  - normal release (push): requires staging to have succeeded
+    #  - rollback (workflow_dispatch): upstream jobs are intentionally skipped.
+    #    !cancelled() overrides the implicit success() check on `needs`, which
+    #    would otherwise skip this job whenever staging is skipped.
+    if: >-
+      !cancelled() &&
+      ((github.event_name == 'push' && needs.deploy-staging.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' && github.event.inputs.rollback_to != ''))
+    needs: [deploy-staging]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # GitHub Environment "production": required reviewers gate + env-scoped role
+    environment:
+      name: production
+      url: https://api.example.com
+    concurrency: { group: backend-prod, cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::222222222222:role/gha-backend-deploy-prod
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Resolve version (new release or explicit rollback target)
+        run: echo "VERSION=${{ github.event.inputs.rollback_to || github.sha }}" >> "$GITHUB_ENV"
+      - name: CodeDeploy blue/green with automatic rollback on alarm
+        # Deployment group is preconfigured with:
+        #  - blue/green: new instances register to LB, old drain after bake time
+        #  - CloudWatch alarms (5xx rate, p99 latency) -> auto rollback
+        run: |
+          DEPLOY_ID=$(aws deploy create-deployment \
+            --application-name ${APP_NAME} \
+            --deployment-group-name production \
+            --deployment-config-name CodeDeployDefault.LinearPercent10Every3Minutes \
+            --auto-rollback-configuration enabled=true,events=DEPLOYMENT_FAILURE,DEPLOYMENT_STOP_ON_ALARM \
+            --s3-location bucket=${ARTIFACT_BUCKET},key=${APP_NAME}/${VERSION}.tar.gz,bundleType=tgz \
+            --query deploymentId --output text)
+          aws deploy wait deployment-successful --deployment-id "$DEPLOY_ID"
+      - name: Post-deploy smoke test
+        run: ./scripts/smoke.sh https://api.example.com
+      - name: Notify (Slack webhook stored as GitHub secret)
+        if: always()
+        run: |
+          curl -sf -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\":\"backend deploy ${VERSION}: ${{ job.status }}\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"

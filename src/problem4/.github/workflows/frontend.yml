@@ -1,0 +1,100 @@
+name: frontend
+
+# Static SPA -> S3 (versioned prefix per release) + CloudFront.
+# Deploy order matters: hashed assets first, index.html last, then invalidate.
+
+on:
+  pull_request:
+    paths: ["frontend/**", ".github/workflows/frontend.yml"]
+  push:
+    branches: [main]
+    paths: ["frontend/**", ".github/workflows/frontend.yml"]
+  workflow_dispatch:
+    inputs:
+      rollback_to:
+        description: "Release (git SHA) to point index.html back to"
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: frontend-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-1
+
+jobs:
+  ci:
+    # Skipped on rollback dispatch: rollback only re-points index.html at a
+    # release already in S3 (deploy-spa.sh detects it and skips asset upload).
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults: { run: { working-directory: frontend } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - name: Build (env-agnostic bundle; runtime config via /config.json per env)
+        run: npm run build
+      - uses: actions/upload-artifact@v4
+        with: { name: dist, path: frontend/dist, retention-days: 30 }
+
+  deploy-staging:
+    if: github.event_name == 'push'
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::111111111111:role/gha-frontend-deploy-staging
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy to staging bucket
+        run: ./scripts/deploy-spa.sh dist example-spa-staging E1STAGINGDISTID ${{ github.sha }}
+      - name: Smoke test
+        run: curl -sfo /dev/null https://app.staging.example.com && echo OK
+
+  deploy-production:
+    # Normal release (push) requires staging success; rollback (workflow_dispatch)
+    # runs with upstream jobs skipped — !cancelled() overrides the implicit
+    # success() check on `needs` that would otherwise skip this job too.
+    if: >-
+      !cancelled() &&
+      ((github.event_name == 'push' && needs.deploy-staging.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' && github.event.inputs.rollback_to != ''))
+    needs: [deploy-staging]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: production
+      url: https://app.example.com
+    concurrency: { group: frontend-prod, cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        if: github.event.inputs.rollback_to == ''
+        with: { name: dist, path: dist }
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::222222222222:role/gha-frontend-deploy-prod
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy (or re-point index.html for instant rollback)
+        run: |
+          VERSION="${{ github.event.inputs.rollback_to || github.sha }}"
+          ./scripts/deploy-spa.sh dist example-spa-prod E1PRODDISTID "$VERSION"
+      - name: Smoke test
+        run: curl -sfo /dev/null https://app.example.com && echo OK
